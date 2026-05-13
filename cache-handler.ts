@@ -3,24 +3,24 @@ import Redis from 'ioredis'
 const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379')
 
 interface CacheEntry {
-  value: ReadableStream
-  timestamp: number
-  revalidate: number
-  expire: number
-  stale: number
+  value: ReadableStream<Uint8Array>
   tags: string[]
+  stale: number
+  timestamp: number
+  expire: number
+  revalidate: number
 }
 
 interface StoredEntry {
   valueBase64: string
-  timestamp: number
-  revalidate: number
-  expire: number
-  stale: number
   tags: string[]
+  stale: number
+  timestamp: number
+  expire: number
+  revalidate: number
 }
 
-async function streamToBuffer(stream: ReadableStream): Promise<Buffer> {
+async function streamToBuffer(stream: ReadableStream<Uint8Array>): Promise<Buffer> {
   const reader = stream.getReader()
   const chunks: Uint8Array[] = []
   while (true) {
@@ -31,7 +31,7 @@ async function streamToBuffer(stream: ReadableStream): Promise<Buffer> {
   return Buffer.concat(chunks.map(c => Buffer.from(c)))
 }
 
-function bufferToStream(buffer: Buffer): ReadableStream {
+function bufferToStream(buffer: Buffer): ReadableStream<Uint8Array> {
   return new ReadableStream({
     start(controller) {
       controller.enqueue(new Uint8Array(buffer))
@@ -41,32 +41,49 @@ function bufferToStream(buffer: Buffer): ReadableStream {
 }
 
 export default {
-  async get(key: string): Promise<CacheEntry | undefined> {
-    const data = await redis.get(key)
+  async get(cacheKey: string, softTags: string[]): Promise<CacheEntry | undefined> {
+    const data = await redis.get(cacheKey)
     if (!data) return undefined
     const stored: StoredEntry = JSON.parse(data)
+
+    const now = Date.now()
+    if (now > stored.timestamp + stored.revalidate * 1000) {
+      return undefined
+    }
+
     return {
-      ...stored,
       value: bufferToStream(Buffer.from(stored.valueBase64, 'base64')),
+      tags: stored.tags,
+      stale: stored.stale,
+      timestamp: stored.timestamp,
+      expire: stored.expire,
+      revalidate: stored.revalidate,
     }
   },
 
-  async set(key: string, value: Promise<CacheEntry> | CacheEntry, ttl?: number) {
-    const entry = await value
+  async set(cacheKey: string, pendingEntry: Promise<CacheEntry>): Promise<void> {
+    const entry = await pendingEntry
     const buffer = await streamToBuffer(entry.value)
     const stored: StoredEntry = {
-      ...entry,
       valueBase64: buffer.toString('base64'),
+      tags: entry.tags,
+      stale: entry.stale,
+      timestamp: entry.timestamp,
+      expire: entry.expire,
+      revalidate: entry.revalidate,
     }
-    const serialized = JSON.stringify(stored)
-    if (ttl) {
-      await redis.set(key, serialized, 'EX', ttl)
-    } else {
-      await redis.set(key, serialized)
-    }
+    await redis.set(cacheKey, JSON.stringify(stored), 'EX', entry.expire)
   },
 
-  async delete(key: string) {
-    await redis.del(key)
+  async refreshTags(): Promise<void> {
+    // 単一クラスタ構成のため no-op
+  },
+
+  async getExpiration(tags: string[]): Promise<number> {
+    return 0
+  },
+
+  async updateTags(tags: string[], durations?: { expire?: number }): Promise<void> {
+    // タグベースの無効化が必要な場合はここに実装する
   },
 }
