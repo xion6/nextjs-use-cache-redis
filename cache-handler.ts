@@ -1,89 +1,41 @@
+/**
+ * 本番用エントリポイント。`next.config.ts` の `cacheHandlers.default` から参照される。
+ *
+ * テスト容易性のため、Redis クライアントの生成と組み立ては `createCacheHandler` に
+ * 委譲する。
+ */
 import Redis from 'ioredis'
 
-const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379')
+import { createCacheHandler } from './create-handler.mts'
 
-interface CacheEntry {
-  value: ReadableStream<Uint8Array>
-  tags: string[]
-  stale: number
-  timestamp: number
-  expire: number
-  revalidate: number
-}
+const redisUrl = process.env.REDIS_URL ?? 'redis://localhost:6379'
 
-interface StoredEntry {
-  valueBase64: string
-  tags: string[]
-  stale: number
-  timestamp: number
-  expire: number
-  revalidate: number
-}
+const redis = new Redis(redisUrl, {
+  maxRetriesPerRequest: 1,
+  retryStrategy(times) {
+    return Math.min(times * 50, 200)
+  },
+  lazyConnect: false,
+})
 
-async function streamToBuffer(stream: ReadableStream<Uint8Array>): Promise<Buffer> {
-  const reader = stream.getReader()
-  const chunks: Uint8Array[] = []
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    chunks.push(value)
+let state: 'initial' | 'connected' | 'disconnected' = 'initial'
+
+redis.on('ready', () => {
+  if (state === 'disconnected') {
+    console.info('[cache-handler] redis reconnected')
   }
-  return Buffer.concat(chunks.map(c => Buffer.from(c)))
-}
+  state = 'connected'
+})
 
-function bufferToStream(buffer: Buffer): ReadableStream<Uint8Array> {
-  return new ReadableStream({
-    start(controller) {
-      controller.enqueue(new Uint8Array(buffer))
-      controller.close()
-    },
-  })
-}
+redis.on('error', () => {
+  // ioredis requires an error listener to avoid uncaught exceptions.
+})
 
-export default {
-  async get(cacheKey: string, softTags: string[]): Promise<CacheEntry | undefined> {
-    const data = await redis.get(cacheKey)
-    if (!data) return undefined
-    const stored: StoredEntry = JSON.parse(data)
+redis.on('close', () => {
+  if (state === 'connected') {
+    console.warn('[cache-handler] redis connection lost, falling back to uncached')
+  }
+  state = 'disconnected'
+})
 
-    const now = Date.now()
-    if (now > stored.timestamp + stored.revalidate * 1000) {
-      return undefined
-    }
-
-    return {
-      value: bufferToStream(Buffer.from(stored.valueBase64, 'base64')),
-      tags: stored.tags,
-      stale: stored.stale,
-      timestamp: stored.timestamp,
-      expire: stored.expire,
-      revalidate: stored.revalidate,
-    }
-  },
-
-  async set(cacheKey: string, pendingEntry: Promise<CacheEntry>): Promise<void> {
-    const entry = await pendingEntry
-    const buffer = await streamToBuffer(entry.value)
-    const stored: StoredEntry = {
-      valueBase64: buffer.toString('base64'),
-      tags: entry.tags,
-      stale: entry.stale,
-      timestamp: entry.timestamp,
-      expire: entry.expire,
-      revalidate: entry.revalidate,
-    }
-    await redis.set(cacheKey, JSON.stringify(stored), 'EX', entry.expire)
-  },
-
-  async refreshTags(): Promise<void> {
-    // 単一クラスタ構成のため no-op
-  },
-
-  async getExpiration(tags: string[]): Promise<number> {
-    return 0
-  },
-
-  async updateTags(tags: string[], durations?: { expire?: number }): Promise<void> {
-    // タグベースの無効化が必要な場合はここに実装する
-  },
-}
+export default createCacheHandler(redis)
