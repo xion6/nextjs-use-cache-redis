@@ -1,0 +1,26 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: nucr-redis
+    ports:
+      - "6379:6379"
+
+  next-a:
+    build: .
+    container_name: nucr-next-a
+    environment:
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "3001:3000"
+    depends_on:
+      - redis
+
+  next-b:
+    build: .
+    container_name: nucr-next-b
+    environment:
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "3002:3000"
+    depends_on:
+      - redis

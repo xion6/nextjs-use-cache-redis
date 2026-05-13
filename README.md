@@ -50,3 +50,26 @@ curl http://localhost:3002/api/cached-value
 kill $(lsof -t -i :3001) $(lsof -t -i :3002)
 docker stop redis
 ```
+
+## docker compose で検証
+
+ECS/Fargate に近い container-to-container 構成での検証手順。Redis + Next.js x 2 をすべてコンテナで起動する。
+
+```bash
+# 起動（初回はビルドあり、~1分）
+docker compose up -d --build
+
+# 同じシナリオで curl
+curl http://localhost:3001/api/cached-value
+curl http://localhost:3002/api/cached-value
+
+# 後片付け
+docker compose down
+```
+
+### host 検証との差
+
+機能的には同じ結果になる（キャッシュ共有・fail-open・警告サイクル）が、1 点だけ違いが出る:
+
+- **Redis 停止直後の初回リクエスト**: host 検証では Docker ポートフォワーダが即座に RST を返すので ~1 秒で打ち切られるが、compose では container-to-container の TCP SYN タイムアウトに引っかかり ~8 秒かかる。2 回目以降は ioredis 内部状態が disconnected になり ~1 秒に戻る
+- 本番（ENI 切断、SG 遮断、NAT 経由の間欠断）は後者に近いので、レイテンシ要件が厳しいなら ioredis の `connectTimeout` を短くする調整余地がある
