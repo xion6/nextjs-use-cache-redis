@@ -73,3 +73,29 @@ docker compose down
 
 - **Redis 停止直後の初回リクエスト**: host 検証では Docker ポートフォワーダが即座に RST を返すので ~1 秒で打ち切られるが、compose では container-to-container の TCP SYN タイムアウトに引っかかり ~8 秒かかる。2 回目以降は ioredis 内部状態が disconnected になり ~1 秒に戻る
 - 本番（ENI 切断、SG 遮断、NAT 経由の間欠断）は後者に近いので、レイテンシ要件が厳しいなら ioredis の `connectTimeout` を短くする調整余地がある
+
+## generateStaticParams + use cache での非伝搬の再現
+
+`cacheHandlers`（複数形）は `'use cache'` のエントリ層しかカバーしない。`generateStaticParams` で列挙したパスはビルド時に静的プリレンダされ、その出力は各インスタンスのファイルシステムに焼かれる。そのため `revalidateTag` を片側で呼んでも、他インスタンスの静的プリレンダ出力には伝わらない。
+
+`app/api/product/[id]/route.ts` がこの状況の最小再現になっている:
+
+- `generateStaticParams` が `[{ id: '1' }]` を返す
+- `getProduct` が `'use cache'` で `cacheTag('product-${id}')` を付ける
+- `cacheLife('weeks')` で時間ベースの再検証を排除している
+
+検証スクリプトを用意した:
+
+```bash
+docker compose up -d --build
+./verify-product-revalidate.sh
+docker compose down
+```
+
+**期待される（バグを示す）出力:**
+
+- 初期取得: A と B の `rand` が一致（ビルド時に焼かれた同じ値）
+- A 側でのみ `revalidate?tag=product-1` を実行
+- 再取得: **A の `rand` だけ更新され、B は古いまま**
+
+これは `cacheHandler`（単数形）が未設定で、ISR / Route Handler レスポンス層が各インスタンスのローカルファイルシステムに閉じているために起きる。単数形ハンドラを Redis 経由で実装すれば閉じる。
