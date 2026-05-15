@@ -122,11 +122,6 @@ export function createCacheHandler(redis: RedisLike): CacheHandler {
         if (!raw) return undefined
 
         const stored = JSON.parse(raw) as StoredEntry
-        const now = Date.now()
-
-        if (now > stored.timestamp + stored.revalidate * 1000) {
-          return undefined
-        }
 
         if (maxTagTimestamp(stored.tags) > stored.timestamp) {
           return undefined
