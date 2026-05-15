@@ -45,6 +45,7 @@ export interface RedisLike {
   mget(...keys: string[]): Promise<(string | null)[]>
   smembers(key: string): Promise<string[]>
   multi(): RedisPipeline
+  eval(script: string, numKeys: number, ...args: (string | number)[]): Promise<unknown>
 }
 
 interface StoredEntry {
@@ -55,6 +56,30 @@ interface StoredEntry {
   expire: number
   revalidate: number
 }
+
+/**
+ * SET 内の各メンバーについて、対応するタイムスタンプ key が消えていれば
+ * SREM し、生きていれば [name, ts, ...] を返す。SREM とタイムスタンプ確認を
+ * サーバー側で atomic に行うため、updateTags との競合で生存中のタグを
+ * 取り違えて削除することがない。
+ */
+const REFRESH_TAGS_LUA = `
+local set_key = KEYS[1]
+local tag_prefix = ARGV[1]
+local members = redis.call('SMEMBERS', set_key)
+local result = {}
+for i = 1, #members do
+  local member = members[i]
+  local ts = redis.call('GET', tag_prefix .. member)
+  if ts then
+    table.insert(result, member)
+    table.insert(result, ts)
+  else
+    redis.call('SREM', set_key, member)
+  end
+end
+return result
+`
 
 async function streamToBuffer(stream: ReadableStream<Uint8Array>): Promise<Buffer> {
   const reader = stream.getReader()
@@ -182,18 +207,34 @@ export function createCacheHandler(redis: RedisLike): CacheHandler {
 
     async refreshTags() {
       try {
-        const tagNames = await redis.smembers(REVALIDATED_TAGS_SET)
-        resetWarnings()
-        if (tagNames.length === 0) return
+        // EVAL を呼ぶ前の局所状態をスナップショット。EVAL 実行中に updateTags が
+        // 新たに書き込んだエントリを誤って削除しないため、トリム対象は
+        // この時点で既に存在していたキーに限定する。
+        const snapshot = new Set(localTagTimestamps.keys())
 
-        const values = await redis.mget(...tagNames.map((t) => TAG_TS_PREFIX + t))
-        for (let i = 0; i < tagNames.length; i++) {
-          const name = tagNames[i]
-          const raw = values[i]
+        const result = (await redis.eval(
+          REFRESH_TAGS_LUA,
+          1,
+          REVALIDATED_TAGS_SET,
+          TAG_TS_PREFIX,
+        )) as string[]
+        resetWarnings()
+
+        const seen = new Set<string>()
+        for (let i = 0; i + 1 < result.length; i += 2) {
+          const name = result[i]
+          const raw = result[i + 1]
           if (name === undefined || raw == null) continue
           const ts = Number(raw)
           if (Number.isFinite(ts) && ts > 0) {
             localTagTimestamps.set(name, ts)
+            seen.add(name)
+          }
+        }
+
+        for (const name of snapshot) {
+          if (!seen.has(name)) {
+            localTagTimestamps.delete(name)
           }
         }
       } catch (err) {
