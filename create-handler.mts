@@ -142,6 +142,17 @@ export function createCacheHandler(redis: RedisLike): CacheHandler {
 
   const pendingSets = new Map<string, Promise<void>>()
 
+  // 起動直後で localTagTimestamps が空のあいだは「無効化情報の不在」を
+  // 「無効化されていない」と取り違え、revalidate 済みエントリを hit として
+  // 返してしまう。初回 refreshTags が Redis 同期に成功するまで get/getExpiration
+  // をゲートし、強制的に miss を返す。
+  //
+  // 一度 true になったあとは false に戻さない。直近で同期できていた状態を
+  // last known state として使い続けるのが Next.js の推奨挙動。
+  // このため、定常運用中の Redis 一時障害では復旧までのあいだ新規の revalidate を
+  // 見落とす窓が残る — 可用性とのトレードオフとして受容する。
+  let tagsBootstrapped = false
+
   // タグの OR セマンティクス: 1つのエントリは複数タグに紐づき、そのうち1つでも
   // エントリ作成より後に revalidate されていれば miss とする。
   // max > timestamp の単一比較でその「いずれかが新しい」を表現する。
@@ -156,6 +167,9 @@ export function createCacheHandler(redis: RedisLike): CacheHandler {
 
   return {
     async get(cacheKey, softTags) {
+      // 初回 refreshTags 成功前は無効化情報が手元にないため、安全側に倒して miss を返す。
+      if (!tagsBootstrapped) return undefined
+
       try {
         const pending = pendingSets.get(cacheKey)
         if (pending) await pending
@@ -273,6 +287,8 @@ export function createCacheHandler(redis: RedisLike): CacheHandler {
             localTagTimestamps.delete(tagName)
           }
         }
+
+        tagsBootstrapped = true
       } catch (err) {
         warn('refreshTags failed', (err as Error).message)
       }
@@ -283,6 +299,9 @@ export function createCacheHandler(redis: RedisLike): CacheHandler {
     // Infinity を返せば「soft tag の判定は get に委ねる」というオプトアウトになるが、
     // ここでは実値を返し、get 側でも二重チェックする防御寄りの構成。
     async getExpiration(tags) {
+      // ブートストラップ前は localTagTimestamps が空で 0 を返してしまうため、
+      // 「いまこの瞬間に revalidate された」相当の値を返し、Next.js 側で stale 扱いさせる。
+      if (!tagsBootstrapped) return Date.now()
       return maxTagTimestamp(tags)
     },
 

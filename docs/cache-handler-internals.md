@@ -75,7 +75,15 @@ VALUE: {"posts", "user:42", "products", "old-tag-already-expired"}
 
 そこで Next.js は適切なタイミングで `refreshTags()` を呼び、ハンドラ側は Redis の `next-cache:revalidated-tags` Set を引き直してローカルマップを最新状態にそろえる。「無効化を書いた側がすべてのプロセスに通知する」プッシュ型ではなく、「読む側が必要なときに引き直す」プル型なので、プロセス間通信や Pub/Sub を必要としない。
 
-### ⑤ エントリ寿命の上限でタグ TTL との不等式を担保する
+### ⑤ 起動直後はゲートで強制 miss にする
+
+③④ の仕組みは「ローカルマップが Redis と同期できている」前提に立っている。プロセス起動直後はローカルマップが空で、その状態で `get` が走ると `maxTagTimestamp = 0` となり、Redis 上には残っている revalidate 済みエントリを「無効化されていない」と誤判定して hit を返してしまう。
+
+そこで `tagsBootstrapped` フラグを持ち、初回 `refreshTags()` 成功までは `get` を強制 `undefined`、`getExpiration` を `Date.now()` にする。Next.js は毎リクエスト前に `refreshTags()` を呼ぶ仕様なので、Redis が生きていれば最初のリクエストでゲートが開く。
+
+一度 true にしたあとは false に戻さない。Next.js が推奨する「`refreshTags` 失敗時は last known local tag state で運転継続」に合わせるため。代わりに、定常運用中の Redis 一時障害では復旧までのあいだ新規の revalidate を見落とす窓が残る — 可用性とのトレードオフとして受容する。
+
+### ⑥ エントリ寿命の上限でタグ TTL との不等式を担保する
 
 このタイムスタンプ方式の正しさは **「タグタイムスタンプの TTL > そのタグを参照しうる全エントリの expire」** という不等式に依存している。これが崩れると、TTL 切れで消えたタグタイムスタンプを参照できなくなり、まだ生きているエントリを `get` したときに `maxTagTimestamp = 0` となって「無効化されていない」と誤判定し、**古いデータを hit として返してしまう**。
 
